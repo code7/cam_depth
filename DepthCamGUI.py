@@ -2,8 +2,13 @@
 
 同时支持两台 VCamera 深度相机：各自独立开关、独立采集、独立缩放、
 独立平面标定与高度图，并额外提供“全部开始 / 全部停止 / 全部获取一帧”的批量操作。
+
+配置：所有和某台相机强相关的参数（标定平面、距离过滤、面板位置、采集参数）
+按相机**序列号**存进加密配置文件 cam_config.enc，只有把对应相机接上、
+读出它的序列号，才解得开属于它的那一段。
 """
 
+import os
 import queue
 import threading
 import time
@@ -15,6 +20,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import vcamera as vcam
+import cam_config as cfgmod
 
 
 CANVAS_W = 600          # 单个相机画布的初始宽度
@@ -27,6 +33,10 @@ NUM_CAMERAS = 2         # 同时支持的深度相机数量
 # 间隔越小画面越流畅，但 Tk 重绘开销越大；深度相机本身出帧不快，80 ms（约 12 fps）足够。
 DISPLAY_INTERVAL_MS = 80
 REFRESH_CHOICES = ("30", "50", "80", "120", "200", "300")
+
+# 配置文件默认放在程序目录下的 config/
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+CONFIG_PATH = os.path.join(CONFIG_DIR, cfgmod.DEFAULT_FILE_NAME)
 
 
 def fit_plane_ransac(depth_data, roi, step=2, max_iter=300, inlier_thresh=4.0, min_inliers=100):
@@ -121,13 +131,16 @@ class CameraPanel:
         self.plane_b = 0.0
         self.plane_c = 0.0
 
+        # ---- 这台相机在配置里的参数（按序列号关联，解锁后填入） ----
+        self.camera_cfg = None
+
         self._build_ui(parent)
 
     # ------------------------------------------------------------------ 界面
     def _build_ui(self, parent):
         self.frame = ttk.LabelFrame(parent, text=self.name)
         self.frame.columnconfigure(0, weight=1)
-        self.frame.rowconfigure(2, weight=1)
+        self.frame.rowconfigure(3, weight=1)
 
         # 设备选择与开关
         top = ttk.Frame(self.frame)
@@ -156,10 +169,29 @@ class CameraPanel:
         self.chk_height = ttk.Checkbutton(ctrl, text="显示高度图", variable=self.show_height)
         self.chk_height.pack(side="left", padx=6)
 
+        # 距离过滤：按相机存，因为两台安装距离往往不同
+        flt = ttk.Frame(self.frame)
+        flt.grid(row=2, column=0, sticky="we", padx=4, pady=(0, 4))
+
+        ttk.Label(flt, text="最小距离(mm):").pack(side="left")
+        self.ent_min = ttk.Entry(flt, width=8)
+        self.ent_min.pack(side="left", padx=(2, 8))
+        self.ent_min.insert(0, str(int(cfgmod.DEFAULT_FILTER["min_mm"])))
+
+        ttk.Label(flt, text="最大距离(mm):").pack(side="left")
+        self.ent_max = ttk.Entry(flt, width=8)
+        self.ent_max.pack(side="left", padx=2)
+        self.ent_max.insert(0, str(int(cfgmod.DEFAULT_FILTER["max_mm"])))
+
+        # 输入框失焦或回车时把过滤区间存进这台相机的配置
+        for ent in (self.ent_min, self.ent_max):
+            ent.bind("<FocusOut>", self.on_filter_changed)
+            ent.bind("<Return>", self.on_filter_changed)
+
         # 画布
         self.canvas = tk.Canvas(self.frame, width=CANVAS_W, height=CANVAS_H, bg="black",
                                 highlightthickness=1, highlightbackground="#888")
-        self.canvas.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self.canvas.grid(row=3, column=0, sticky="nsew", padx=4, pady=(0, 4))
         self.canvas.bind("<Configure>", lambda e: self._on_canvas_resize())
         self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
         self.canvas.bind("<B1-Motion>", self.on_drag_move)
@@ -171,10 +203,49 @@ class CameraPanel:
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
 
         self.lbl_coord = tk.Label(self.frame, text="坐标: (---, ---)   深度: ---", anchor="w")
-        self.lbl_coord.grid(row=3, column=0, sticky="we", padx=4)
+        self.lbl_coord.grid(row=4, column=0, sticky="we", padx=4)
 
         self.lbl_status = tk.Label(self.frame, text="未打开", anchor="w", fg="#555")
-        self.lbl_status.grid(row=4, column=0, sticky="we", padx=4, pady=(0, 4))
+        self.lbl_status.grid(row=5, column=0, sticky="we", padx=4, pady=(0, 4))
+
+    # ------------------------------------------------------------------ 配置
+    def bind_camera_config(self, cfg: dict):
+        """把从配置文件解出来的参数应用到本面板。"""
+        self.camera_cfg = cfg
+
+        flt = cfg.get("filter") or {}
+        self.ent_min.delete(0, "end")
+        self.ent_min.insert(0, f"{float(flt.get('min_mm', cfgmod.DEFAULT_FILTER['min_mm'])):.0f}")
+        self.ent_max.delete(0, "end")
+        self.ent_max.insert(0, f"{float(flt.get('max_mm', cfgmod.DEFAULT_FILTER['max_mm'])):.0f}")
+
+        cal = cfg.get("calibration") or {}
+        if cfgmod.is_calibrated(cfg):
+            a, b, c = (float(v) for v in cal["coefficients"])
+            self.plane_a, self.plane_b, self.plane_c = a, b, c
+            self.calibrated = True
+            self.roi = tuple(cal["roi"]) if cal.get("roi") else None
+        else:
+            self.calibrated = False
+            self.roi = None
+
+    def on_filter_changed(self, _event=None):
+        """距离过滤输入框变化：写回这台相机的配置并存盘。"""
+        rng = self.get_dist_range()
+        if rng[0] is None or self.serial is None:
+            return
+        cfg = self.app.store.camera(self.serial)
+        cfg["filter"] = {"min_mm": rng[0], "max_mm": rng[1]}
+        self.app.save_config(f"相机 {self.index + 1} 距离过滤已保存")
+
+    def get_dist_range(self):
+        """返回 (min_mm, max_mm)；输入非法或区间反了就返回 (None, None)。"""
+        try:
+            mn = float(self.ent_min.get())
+            mx = float(self.ent_max.get())
+        except ValueError:
+            return None, None
+        return (mn, mx) if mx > mn else (None, None)
 
     # ------------------------------------------------------------------ 帧回调
     def frame_callback(self, frame_set):
@@ -233,10 +304,27 @@ class CameraPanel:
             messagebox.showerror("打开失败", f"{self.name}: 使能深度传感器失败")
             return
 
+        # 把配置里存的采集参数下发到相机（必须在 StartCapture 之前，
+        # 实测采集期间写 feature 会返回 DeviceBusy）
+        acq_warnings = self.apply_acquisition_config(cam)
+
         cam.RegisterFrameSetCallback(self.frame_callback)
 
         self.cam = cam
         self.serial = serial
+
+        # 记住面板归属并记录实际生效的采集参数（写回加密配置）
+        cfg = app.store.camera(serial)
+        cfg["panel"] = self.index
+        cfg["model"] = str(getattr(info, "model", "") or "")
+        cfg["firmware"] = str(getattr(info, "firmware_version", "") or "")
+        self.camera_cfg = cfg
+        # 切到这台相机就载入它自己的过滤区间和标定参数
+        self.bind_camera_config(cfg)
+        app.store.apply_acquisition_from_camera(
+            serial, self._read_acquisition_features(cam),
+            self._read_image_mode(cam), acq_warnings)
+
         self._clear_queue()
         self.combo.config(state="disabled")
         self.btn_open.config(state="disabled")
@@ -245,8 +333,102 @@ class CameraPanel:
         self.btn_stop.config(state="disabled")
         self.btn_grab.config(state="normal")
         self.btn_calib.config(state="normal", text="标定平面", command=self.start_calibration)
-        self.lbl_status.config(text=f"已打开 {serial}，请点击【开始】或【获取一帧】")
+        note = ""
+        if self.calibrated:
+            note = "，已载入标定参数"
+        if acq_warnings:
+            note += f"，采集参数有 {len(acq_warnings)} 条告警"
+        self.lbl_status.config(text=f"已打开 {serial}{note}，请点击【开始】或【获取一帧】")
+        app.save_config()
         app.update_global_buttons()
+
+    # ------------------------------------------------------------------ 采集参数
+    def _read_acquisition_features(self, cam) -> dict:
+        """读回相机上实际生效的采集参数，用于存进配置。"""
+        out = {}
+        for name in cfgmod.ACQ_FEATURES:
+            try:
+                feat, st = cam.GetFeature(name)
+                if not st:
+                    continue
+                val, vs = feat.GetValue()
+                if not vs:
+                    continue
+                out[name] = {
+                    "type": str(feat.GetType()).split(".")[-1],
+                    "value": bool(val) if isinstance(val, bool) else float(val),
+                }
+            except Exception:
+                continue
+        return out
+
+    def _read_image_mode(self, cam):
+        try:
+            mode, st = cam.GetCurrentImageMode(vcam.SensorType.Depth)
+            if not st or mode is None:
+                return None
+            return {"width": int(mode.width), "height": int(mode.height),
+                    "pixel_format": str(getattr(mode, "pixel_format", "")).split(".")[-1]}
+        except Exception:
+            return None
+
+    def apply_acquisition_config(self, cam) -> list:
+        """把配置里的采集参数写到相机上，返回告警列表。
+
+        单条写不进去只记告警、不阻断开机 —— 现场换一台不支持某参数的相机，
+        程序仍然要能起来。
+        """
+        warnings = []
+        cfg = self.camera_cfg
+        if not cfg:
+            return warnings
+
+        acq = cfg.get("acquisition") or {}
+        feats = acq.get("features") or {}
+        for name, item in feats.items():
+            try:
+                feat, st = cam.GetFeature(name)
+                if not st:
+                    warnings.append(f"{name} 相机不支持，已跳过")
+                    continue
+                acc, _ = feat.GetAccessMode()
+                if str(acc).split(".")[-1] not in ("Writable", "ReadWritable"):
+                    warnings.append(f"{name} 只读，已跳过")
+                    continue
+                st = feat.SetValue(item["value"])
+                if not st:
+                    warnings.append(f"{name} 写入失败：{st.message()}")
+                    continue
+                val, vs = feat.GetValue()
+                if vs and val != item["value"]:
+                    warnings.append(f"{name} 实际生效为 {val}（要求 {item['value']}）")
+            except Exception as e:
+                warnings.append(f"{name} 写入异常：{e}")
+
+        mode = acq.get("image_mode")
+        if mode:
+            try:
+                modes, st = cam.GetImageModes(vcam.SensorType.Depth)
+                if st and modes:
+                    match = None
+                    for m in modes:
+                        if (int(m.width) == mode["width"] and int(m.height) == mode["height"]
+                                and (not mode.get("pixel_format")
+                                     or str(getattr(m, "pixel_format", "")).split(".")[-1]
+                                     == mode["pixel_format"])):
+                            match = m
+                            break
+                    if match is None:
+                        warnings.append("配置里的图像模式当前相机不支持，已跳过")
+                    else:
+                        st = cam.SetImageMode(vcam.SensorType.Depth, match)
+                        if not st:
+                            warnings.append(f"图像模式写入失败：{st.message()}")
+                else:
+                    warnings.append("无法读取图像模式列表，已跳过")
+            except Exception as e:
+                warnings.append(f"图像模式写入异常：{e}")
+        return warnings
 
     def close_camera(self):
         if self.cam is None:
@@ -433,7 +615,7 @@ class CameraPanel:
     def _make_vis(self, vis_data):
         if self.show_height.get() and self.calibrated:
             return self._make_vis_auto(vis_data)
-        mn, mx = self.app.get_dist_range()
+        mn, mx = self.get_dist_range()
         if mn is not None:
             vis = (vis_data - mn) * (255.0 / (mx - mn))
             np.clip(vis, 0.0, 255.0, out=vis)
@@ -669,12 +851,32 @@ class CameraPanel:
         a, b, c, ratio = result
         self.plane_a, self.plane_b, self.plane_c = a, b, c
         self.calibrated = True
+
+        # 标定结果按序列号写回加密配置：只有这台相机接上才解得开
+        saved = ""
+        if self.serial is not None:
+            cfg = self.app.store.camera(self.serial)
+            cfg["calibration"] = {
+                "type": "plane_xy",
+                "coefficients": [float(a), float(b), float(c)],
+                "unit": "mm",
+                "roi": list(self.roi) if self.roi else None,
+                "inlier_ratio": float(ratio),
+                "calibrated_at": cfgmod.now_str(),
+            }
+            self.camera_cfg = cfg
+            if self.app.save_config():
+                saved = "，已保存到配置"
+            else:
+                saved = "，但配置保存失败"
+
         self.lbl_status.config(
-            text=f"标定完成：d = {a:.5f}·x + {b:.5f}·y + {c:.2f}，内点率 {ratio:.1%}。勾选【显示高度图】查看高度")
+            text=f"标定完成：d = {a:.5f}·x + {b:.5f}·y + {c:.2f}，内点率 {ratio:.1%}{saved}。"
+                 f"勾选【显示高度图】查看高度")
 
 
 class DepthCamApp:
-    """主窗口：两台深度相机面板 + 全局的距离过滤与批量操作。"""
+    """主窗口：两台深度相机面板 + 全局的批量操作与配置管理。"""
 
     def __init__(self, root):
         self.root = root
@@ -685,10 +887,99 @@ class DepthCamApp:
         self.panels = []
         self.display_interval_ms = DISPLAY_INTERVAL_MS
 
+        # 配置：先只读容器。此时还不知道相机 ID，所以解不开任何一段。
+        # 真正解密发生在扫描拿到序列号之后（见 unlock_config）。
+        self.store = cfgmod.ConfigStore(CONFIG_PATH)
+        self.has_config_file = self.store.load()
+        self.unlock_report = None
+
         self._build_ui()
+        self._apply_app_config()
 
         vcam.CameraUtils.Init(True)
         self.root.after(self.display_interval_ms, self._tick)
+
+    # ------------------------------------------------------------------ 配置
+    def _apply_app_config(self):
+        """应用与具体相机无关的全局配置。"""
+        ms = int(self.store.app.get("display_interval_ms", DISPLAY_INTERVAL_MS))
+        self.display_interval_ms = max(10, ms)
+        self.cmb_refresh.set(str(ms) if str(ms) in REFRESH_CHOICES else str(DISPLAY_INTERVAL_MS))
+
+        if self.store.warnings:
+            for w in self.store.warnings:
+                print(f"[配置告警] {w}")
+
+        if not self.has_config_file:
+            state = "未找到配置文件，将使用默认参数"
+        else:
+            state = f"配置已读取（{self.store.segment_count()} 段），扫描到相机后解锁"
+        self.lbl_status.config(text=state)
+
+    def unlock_config(self, serials):
+        """用扫描到的相机序列号解开配置，并把参数分发到各面板。
+
+        这是"先拿相机 ID、再解密、再初始化"的核心环节。
+        """
+        self.store.reset_decoded()
+        report = self.store.unlock(serials)
+        self.unlock_report = report
+
+        # 按配置里的 panel 字段稳定分配面板，避免发现顺序变化导致两路接反
+        assigned = {}          # panel 索引 -> 序列号
+        claimed = set()
+        for serial, cfg in self.store.cameras.items():
+            p = cfg.get("panel")
+            if isinstance(p, int) and 0 <= p < len(self.panels) and p not in assigned:
+                assigned[p] = serial
+                claimed.add(serial)
+
+        names = [str(c.serial_number) for c in self.cam_infos]
+        for i, panel in enumerate(self.panels):
+            serial = assigned.get(i)
+            if serial is None:
+                # 没有面板归属的相机（新相机）按序列号排序依次填充，
+                # 保证同一批相机每次的分配结果一致
+                free = [s for s in sorted(names) if s not in claimed]
+                if not free:
+                    continue
+                serial = free[0]
+                assigned[i] = serial
+                claimed.add(serial)
+            try:
+                panel.combo.current(names.index(serial))
+            except ValueError:
+                continue
+            panel.bind_camera_config(self.store.camera(serial))
+            self.store.camera(serial)["panel"] = i
+
+        return report
+
+    def save_config(self, note=""):
+        """把当前内存里的配置加密回写。"""
+        ok = self.store.save()
+        if not ok and self.store.warnings:
+            self.lbl_status.config(text=f"配置保存失败：{self.store.warnings[-1]}")
+            return False
+        if note:
+            self.lbl_status.config(text=note)
+        return True
+
+    def config_summary(self):
+        """给状态栏用的一句话配置概览。"""
+        if not self.has_config_file:
+            return "无配置文件"
+        r = self.unlock_report
+        if not r:
+            return f"配置 {self.store.segment_count()} 段未解锁"
+        parts = [f"解锁 {len(r['unlocked'])} 台"]
+        if r["missing"]:
+            parts.append(f"{len(r['missing'])} 台无配置")
+        if r["rejected"]:
+            parts.append(f"{len(r['rejected'])} 台未授权")
+        if self.store.locked:
+            parts.append(f"{self.store.locked} 段打不开")
+        return "配置：" + "，".join(parts)
 
     # ------------------------------------------------------------------ 显示节拍
     def _tick(self):
@@ -707,7 +998,8 @@ class DepthCamApp:
         except ValueError:
             return
         self.display_interval_ms = max(10, ms)
-        self.lbl_status.config(text=f"显示刷新间隔已设为 {self.display_interval_ms} ms")
+        self.store.app["display_interval_ms"] = self.display_interval_ms
+        self.save_config(f"显示刷新间隔已设为 {self.display_interval_ms} ms")
 
     # ------------------------------------------------------------------ 界面
     def _build_ui(self):
@@ -717,16 +1009,6 @@ class DepthCamApp:
 
         self.btn_scan = ttk.Button(bar, text="扫描", command=self.scan_cameras)
         self.btn_scan.pack(side="left")
-
-        ttk.Label(bar, text="最小距离(mm):").pack(side="left", padx=(12, 2))
-        self.ent_min = ttk.Entry(bar, width=8)
-        self.ent_min.pack(side="left")
-        self.ent_min.insert(0, "500")
-
-        ttk.Label(bar, text="最大距离(mm):").pack(side="left", padx=(12, 2))
-        self.ent_max = ttk.Entry(bar, width=8)
-        self.ent_max.pack(side="left")
-        self.ent_max.insert(0, "2000")
 
         self.btn_start_all = ttk.Button(bar, text="全部开始", command=self.start_all, state="disabled")
         self.btn_start_all.pack(side="left", padx=(16, 2))
@@ -741,12 +1023,15 @@ class DepthCamApp:
         self.cmb_refresh.set(str(DISPLAY_INTERVAL_MS))
         self.cmb_refresh.bind("<<ComboboxSelected>>", self.set_refresh_interval)
 
+        self.lbl_config = tk.Label(self.root, text="", anchor="w", fg="#0a6")
+        self.lbl_config.grid(row=1, column=0, sticky="we", padx=5)
+
         self.lbl_status = tk.Label(self.root, text="请先点击【扫描】", anchor="w")
-        self.lbl_status.grid(row=1, column=0, sticky="we", padx=5)
+        self.lbl_status.grid(row=2, column=0, sticky="we", padx=5)
 
         # 两台相机的面板并排显示
         container = ttk.Frame(self.root)
-        container.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+        container.grid(row=3, column=0, sticky="nsew", padx=5, pady=5)
         for col in range(NUM_CAMERAS):
             container.columnconfigure(col, weight=1)
         container.rowconfigure(0, weight=1)
@@ -757,7 +1042,7 @@ class DepthCamApp:
             self.panels.append(panel)
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=1)
         self.root.bind("<Control-0>", lambda e: self.reset_all_zoom())
 
     # ------------------------------------------------------------------ 面板协作
@@ -776,14 +1061,6 @@ class DepthCamApp:
         self.btn_start_all.config(state="normal" if any_idle else "disabled")
         self.btn_stop_all.config(state="normal" if any_running else "disabled")
         self.btn_grab_all.config(state="normal" if any_idle else "disabled")
-
-    def get_dist_range(self):
-        try:
-            mn = float(self.ent_min.get())
-            mx = float(self.ent_max.get())
-        except ValueError:
-            return None, None
-        return (mn, mx) if mx > mn else (None, None)
 
     def reset_all_zoom(self):
         for p in self.panels:
@@ -816,23 +1093,39 @@ class DepthCamApp:
             for p in self.panels:
                 p.combo["values"] = []
                 p.combo.set("")
+            self.lbl_config.config(text="")
             self.update_global_buttons()
             self.lbl_status.config(text="扫描完成：未发现设备")
             return
 
         names = [str(c.serial_number) for c in cam_infos]
-        for i, p in enumerate(self.panels):
+        for p in self.panels:
             p.combo["values"] = names
-            # 默认把第 i 台设备分配给第 i 个面板，避免两台相机选到同一台
-            p.combo.current(i if i < len(names) else 0)
+            p.combo.current(0)
 
         self.update_global_buttons()
+
+        # 拿到相机 ID 了，现在才解锁配置并按序列号把参数分发到各面板
+        self.lbl_status.config(text="正在解锁配置...")
+        self.root.update_idletasks()
+        report = self.unlock_config(names)
+
+        self.lbl_config.config(text=self.config_summary())
+
+        msgs = []
         if len(cam_infos) < NUM_CAMERAS:
-            self.lbl_status.config(
-                text=f"扫描完成：只发现 {len(cam_infos)} 个设备，需要 {NUM_CAMERAS} 台才能双路同时采集")
+            msgs.append(f"只发现 {len(cam_infos)} 个设备（需要 {NUM_CAMERAS} 台才能双路同时采集）")
         else:
-            self.lbl_status.config(
-                text=f"扫描完成：发现 {len(cam_infos)} 个设备，请分别点击两个面板的【打开】")
+            msgs.append(f"发现 {len(cam_infos)} 个设备，请分别点击两个面板的【打开】")
+        if report["rejected"]:
+            msgs.append("未授权的相机：" + "、".join(report["rejected"]))
+        for serial, why in report["failed"]:
+            msgs.append(f"{serial} 配置解不开：{why}")
+        if self.store.locked:
+            msgs.append(f"另有 {self.store.locked} 段配置不属于当前相机，已原样保留")
+        if report["missing"]:
+            msgs.append("无配置（将用默认参数）：" + "、".join(report["missing"]))
+        self.lbl_status.config(text="扫描完成：" + "；".join(msgs))
 
     # ------------------------------------------------------------------ 批量操作
     def start_all(self):
@@ -862,6 +1155,8 @@ class DepthCamApp:
     def on_close(self):
         for p in self.panels:
             p.close_camera()
+        if self.store.dirty or self.store.segment_count() or self.store.cameras:
+            self.store.save()
         self.root.destroy()
 
 
