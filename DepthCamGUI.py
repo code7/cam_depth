@@ -8,6 +8,7 @@
 读出它的序列号，才解得开属于它的那一段。
 """
 
+import collections
 import os
 import queue
 import threading
@@ -34,9 +35,33 @@ NUM_CAMERAS = 2         # 同时支持的深度相机数量
 DISPLAY_INTERVAL_MS = 80
 REFRESH_CHOICES = ("30", "50", "80", "120", "200", "300")
 
+# 超过这么久没有新帧就在状态栏给出断流提示
+STALL_WARN_S = 3.0
+
 # 配置文件默认放在程序目录下的 config/
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
 CONFIG_PATH = os.path.join(CONFIG_DIR, cfgmod.DEFAULT_FILE_NAME)
+
+
+def value_to_python(v):
+    """把 SDK 的 Value 包装类型转成可 JSON 序列化的基本类型。
+
+    注意不能用 isinstance(v, bool) 判断：Value 是包装类型，
+    isinstance 永远是假，会走到错误的转换分支并抛异常。
+    必须用它自己的类型查询和访问器。
+    """
+    try:
+        if v.IsBool():
+            return bool(v.as_bool())
+        if v.IsString():
+            return str(v.as_string())
+        if v.IsFloat() or v.IsDouble():
+            return float(v.as_float())
+        if v.IsArray() or v.IsDictionary():
+            return None
+        return int(v.as_number())
+    except Exception:
+        return None
 
 
 def fit_plane_ransac(depth_data, roi, step=2, max_iter=300, inlier_thresh=4.0, min_inliers=100):
@@ -133,6 +158,24 @@ class CameraPanel:
 
         # ---- 这台相机在配置里的参数（按序列号关联，解锁后填入） ----
         self.camera_cfg = None
+
+        # ---- 帧间隔统计 ----
+        # 注意线程边界：frame_callback 跑在 SDK 原生线程上，只允许读写这几个
+        # 普通变量；任何 Tk 控件的更新都必须回到主线程（见 pump_frame）。
+        self.frames_received = 0        # 相机回调送来的帧总数
+        self.frames_dropped = 0         # 显示来不及消费、被丢掉的帧数
+        self.last_arrival = None        # 上一帧到达时刻（time.monotonic）
+        self.arrival_ms = None          # 最近一次「上一帧 → 这一帧」的间隔
+        self.arrival_history = collections.deque(maxlen=10)
+        self.last_render_wall = None    # 上一帧真正画到屏幕上的时刻
+        self.stall_notified = False
+
+        # ---- 「这一帧到达到上屏」的耗时（毫秒）----
+        self.latency_ms = None          # 最近一次的总耗时
+        self.latency_history = collections.deque(maxlen=10)
+        self.stage_wait_ms = None       # 到达 → 开始处理（在队列里等刷新节拍）
+        self.stage_compute_ms = None    # 取图 / 换算 / 高度图 / 配色
+        self.stage_show_ms = None       # 缩放 / 上屏
 
         self._build_ui(parent)
 
@@ -249,8 +292,25 @@ class CameraPanel:
 
     # ------------------------------------------------------------------ 帧回调
     def frame_callback(self, frame_set):
-        if not self.frame_queue.full():
-            self.frame_queue.put_nowait(frame_set)
+        """SDK 原生线程回调：只记录间隔并尽快入队，绝不碰 Tk 控件。
+
+        队列只有 1 个位置：显示来不及消费时，新帧直接丢掉并计数。
+        所以「收到多少帧」和「画了多少帧」是两件事，界面会把两者都显示出来。
+        """
+        now = time.monotonic()
+        prev = self.last_arrival
+        self.last_arrival = now
+        if prev is not None:
+            self.arrival_ms = (now - prev) * 1000.0
+            self.arrival_history.append(self.arrival_ms)
+        self.frames_received += 1
+        # 连同到达时刻一起入队：显示端要算「这一帧从到达到上屏花了多久」。
+        # 不能用另一个成员变量记时刻——回调线程可能在主线程取走帧之后、
+        # 读取时刻之前又塞进新的一帧，那样量出来的耗时会偏小。
+        try:
+            self.frame_queue.put_nowait((now, frame_set))
+        except queue.Full:
+            self.frames_dropped += 1
 
     def _clear_queue(self):
         while True:
@@ -283,7 +343,11 @@ class CameraPanel:
 
         status = cam.Connect()
         if not status:
-            messagebox.showerror("打开失败", f"{self.name} 连接相机失败: {status.message()}")
+            hint = ""
+            if "busy" in status.message().lower():
+                hint = "（相机已被占用，请先关掉另一个正在运行的程序实例）"
+            messagebox.showerror("打开失败",
+                                 f"{self.name} 连接相机失败: {status.message()}{hint}")
             return
 
         try:
@@ -354,10 +418,10 @@ class CameraPanel:
                 val, vs = feat.GetValue()
                 if not vs:
                     continue
-                out[name] = {
-                    "type": str(feat.GetType()).split(".")[-1],
-                    "value": bool(val) if isinstance(val, bool) else float(val),
-                }
+                py = value_to_python(val)
+                if py is None:
+                    continue
+                out[name] = {"type": str(feat.GetType()).split(".")[-1], "value": py}
             except Exception:
                 continue
         return out
@@ -487,14 +551,63 @@ class CameraPanel:
                 messagebox.showerror("开始失败", f"{self.name}：启动采集失败")
             return False
 
+        self._reset_frame_stats()
         self.is_running = True
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_grab.config(state="disabled")
-        self.lbl_status.config(text="采集中...")
+        self.lbl_status.config(text="采集中...  等待第一帧")
         self.app.update_global_buttons()
         # 显示由主窗口的统一节拍驱动（见 DepthCamApp._tick），这里不再各自起定时器
         return True
+
+    def _reset_frame_stats(self):
+        self.frames_received = 0
+        self.frames_dropped = 0
+        self.last_arrival = None
+        self.arrival_ms = None
+        self.arrival_history.clear()
+        self.last_render_wall = None
+        self.stall_notified = False
+        self.latency_ms = None
+        self.latency_history.clear()
+        self.stage_wait_ms = None
+        self.stage_compute_ms = None
+        self.stage_show_ms = None
+
+    def frame_status_text(self):
+        """状态栏里的采集信息：帧间隔、平均间隔/帧率、收帧与丢帧数。"""
+        if self.arrival_ms is None:
+            return "采集中...  等待第一帧"
+        text = f"采集中...   帧间隔 {self.arrival_ms:.0f} ms"
+        if self.arrival_history:
+            avg = sum(self.arrival_history) / len(self.arrival_history)
+            fps = 1000.0 / avg if avg > 0 else 0.0
+            text += f"（近 {len(self.arrival_history)} 帧均 {avg:.0f} ms ≈ {fps:.2f} fps）"
+        text += f"   收 {self.frames_received} 帧"
+        if self.frames_dropped:
+            text += f" / 丢 {self.frames_dropped} 帧"
+        return text
+
+    def timing_text(self):
+        """第二行：从帧到达，到（用标定平面算出的）画面真正上屏花了多久。"""
+        if self.latency_ms is None:
+            return None
+        if self.show_height.get() and self.calibrated:
+            label = "高度图耗时"
+        else:
+            label = "显示耗时"
+        avg = (sum(self.latency_history) / len(self.latency_history)
+               if self.latency_history else self.latency_ms)
+        return (f"{label} {self.latency_ms:.0f} ms ＝ 等待 {self.stage_wait_ms:.0f}"
+                f" + 计算 {self.stage_compute_ms:.0f}"
+                f" + 上屏 {self.stage_show_ms:.0f}   （近 {len(self.latency_history)} 帧均 {avg:.0f} ms）")
+
+    def status_text(self):
+        """状态栏完整文字（采集信息 + 耗时拆解）。"""
+        first = self.frame_status_text()
+        second = self.timing_text()
+        return first if second is None else f"{first}\n{second}"
 
     def stop_capture(self, quiet=False):
         if not self.is_running:
@@ -509,7 +622,16 @@ class CameraPanel:
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_grab.config(state="normal")
-        self.lbl_status.config(text="已停止采集")
+        summary = f"已停止采集（共收 {self.frames_received} 帧"
+        if self.arrival_history:
+            avg = sum(self.arrival_history) / len(self.arrival_history)
+            summary += f"，平均间隔 {avg:.0f} ms"
+        if self.frames_dropped:
+            summary += f"，丢弃 {self.frames_dropped} 帧"
+        if self.latency_history:
+            lat = sum(self.latency_history) / len(self.latency_history)
+            summary += f"，上屏平均 {lat:.0f} ms"
+        self.lbl_status.config(text=summary + "）")
         self.app.update_global_buttons()
         return True
 
@@ -540,6 +662,7 @@ class CameraPanel:
         error = None
         elapsed = None
         fs = None
+        arrival = None
         try:
             self._clear_queue()
             if not self.cam.StartCapture():
@@ -549,7 +672,7 @@ class CameraPanel:
                 deadline = time.time() + GRAB_TIMEOUT
                 while time.time() < deadline:
                     try:
-                        fs = self.frame_queue.get(timeout=0.5)
+                        arrival, fs = self.frame_queue.get(timeout=0.5)
                         break
                     except queue.Empty:
                         continue
@@ -564,9 +687,9 @@ class CameraPanel:
                 self.cam.StopCapture()
             except Exception:
                 pass
-        self.root.after(0, lambda: self._grab_done(fs, elapsed, error))
+        self.root.after(0, lambda: self._grab_done(fs, elapsed, error, arrival))
 
-    def _grab_done(self, fs, elapsed, error):
+    def _grab_done(self, fs, elapsed, error, arrival=None):
         self.is_grabbing = False
         self.btn_grab.config(state="normal")
         self.btn_start.config(state="normal")
@@ -581,15 +704,24 @@ class CameraPanel:
             self.lbl_status.config(text="获取一帧超时")
             self.app.update_global_buttons()
             return
-        if not self._render_frame(fs):
+        if not self._render_frame(fs, arrival):
             messagebox.showwarning("提示", f"{self.name}：帧无效")
             self.lbl_status.config(text="获取一帧失败：帧无效")
         else:
-            self.lbl_status.config(text=f"已获取一帧（{elapsed:.0f} ms）")
+            text = f"已获取一帧（采集启动到收帧 {elapsed:.0f} ms）"
+            if self.latency_ms is not None:
+                text += f"；上屏耗时 {self.latency_ms:.0f} ms"
+            self.lbl_status.config(text=text)
         self.app.update_global_buttons()
 
     # ------------------------------------------------------------------ 显示
-    def _render_frame(self, fs):
+    def _render_frame(self, fs, arrival=None):
+        """处理一帧并上屏。
+
+        arrival 是这一帧到达的 time.monotonic 时刻；给了它就会记录
+        「到达到上屏」的总耗时，并拆成 等待 / 计算（含高度图）/ 上屏 三段。
+        """
+        t_start = time.perf_counter()
         depth_image = fs.GetImage(vcam.SensorType.Depth)
         if not depth_image.IsValid():
             return False
@@ -608,8 +740,18 @@ class CameraPanel:
         self._preview = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
         self.src_w = self.depth_w
         self.src_h = self.depth_h
+        t_computed = time.perf_counter()
 
         self._redraw_image()
+        t_shown = time.perf_counter()
+
+        # 这一段耗时（取图 → 高度图算完 → 上屏）
+        self.stage_compute_ms = (t_computed - t_start) * 1000.0
+        self.stage_show_ms = (t_shown - t_computed) * 1000.0
+        if arrival is not None:
+            self.stage_wait_ms = (t_start - arrival) * 1000.0
+            self.latency_ms = (t_shown - arrival) * 1000.0
+            self.latency_history.append(self.latency_ms)
         return True
 
     def _make_vis(self, vis_data):
@@ -718,13 +860,32 @@ class CameraPanel:
         if not self.is_running:
             return
         try:
-            fs = self.frame_queue.get_nowait()
+            arrival, fs = self.frame_queue.get_nowait()
         except queue.Empty:
+            self._check_stall()
             return
         try:
-            self._render_frame(fs)
+            ok = self._render_frame(fs, arrival)
         except Exception as e:
             self.lbl_status.config(text=f"显示错误: {e}")
+            return
+        if not ok:
+            return
+
+        self.last_render_wall = time.monotonic()
+        self.stall_notified = False
+        self.lbl_status.config(text=self.status_text())
+
+    def _check_stall(self):
+        """长时间没有新帧时提示一次（相机断流/掉线），避免界面悄悄停住没人知道。"""
+        if self.stall_notified or self.last_render_wall is None:
+            return
+        gap = time.monotonic() - self.last_render_wall
+        if gap < STALL_WARN_S:
+            return
+        self.stall_notified = True
+        self.lbl_status.config(
+            text=f"⚠ 采集中，但已 {gap:.1f} s 没有新帧（相机可能断流）")
 
     def compute_height_map(self):
         # 用广播代替 np.indices，避免每帧分配两块 int64 全尺寸数组（2048x1536 时各 25MB）

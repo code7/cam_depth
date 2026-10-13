@@ -136,8 +136,8 @@ def main():
         orig = p._render_frame
 
         def make(orig, i):
-            def wrapper(fs):
-                r = orig(fs)
+            def wrapper(*args, **kwargs):
+                r = orig(*args, **kwargs)
                 if r:
                     counters[i] += 1
                 return r
@@ -162,7 +162,9 @@ def main():
           None,
           lambda: len({p.combo.get() for p in app.panels}) == 2)
     d.add("打开两台相机",
-          lambda: [p.open_camera() for p in app.panels],
+          lambda: ([p.open_camera() for p in app.panels],
+                   print(f"    [诊断] cam={[p.cam is not None for p in app.panels]} "
+                         f"serial={[p.serial for p in app.panels]}", flush=True)),
           lambda: all(p.cam is not None for p in app.panels), timeout=30)
     d.add("两台序列号不同",
           None,
@@ -187,6 +189,18 @@ def main():
     d.add("持续采集 2 秒",
           lambda: state.update(t0=time.time()),
           lambda: time.time() - state["t0"] > 2.0, timeout=30)
+    d.add("状态栏显示帧间隔",
+          None,
+          lambda: state.update(
+              status=[p.status_text() for p in app.panels],
+              recv=[p.frames_received for p in app.panels],
+              drop=[p.frames_dropped for p in app.panels],
+              arr=[p.arrival_ms for p in app.panels]) or
+          all(p.arrival_ms is not None and "帧间隔" in p.status_text()
+              for p in app.panels))
+    d.add("状态栏文字已刷新到界面",
+          None,
+          lambda: all("帧间隔" in p.lbl_status.cget("text") for p in app.panels))
 
     # ------------------------------------------------------------ 标定 + 存盘
     d.add("两路分别标定平面",
@@ -197,6 +211,27 @@ def main():
           None,
           lambda: all(cfgmod.is_calibrated(app.store.camera(p.serial))
                       for p in app.panels))
+
+    # ------------------------------------------------------------ 高度图耗时
+    d.add("打开高度图显示",
+          lambda: [p.show_height.set(True) for p in app.panels],
+          lambda: True)
+    d.add("等几个高度图帧",
+          lambda: state.update(t_h=time.time()),
+          lambda: time.time() - state["t_h"] > 2.5)
+    d.add("高度图耗时可读，且标注为高度图",
+          None,
+          lambda: state.update(height_timing=[p.timing_text() for p in app.panels],
+                               height_lat=[p.latency_ms for p in app.panels],
+                               height_comp=[p.stage_compute_ms for p in app.panels]) or
+          all(p.latency_ms is not None and "高度图耗时" in (p.timing_text() or "")
+              for p in app.panels))
+    d.add("关掉高度图后标注回退为显示耗时",
+          lambda: [p.show_height.set(False) for p in app.panels],
+          lambda: all("显示耗时" in (p.timing_text() or "") for p in app.panels))
+    d.add("重新打开高度图",
+          lambda: [p.show_height.set(True) for p in app.panels],
+          lambda: True)
 
     # ------------------------------------------------------------ 距离过滤按相机存
     d.add("改面板1的过滤区间并存盘",
@@ -309,6 +344,15 @@ def main():
     print()
     print("设备列表:", state["serials"])
     print("每路渲染帧数:", counters)
+    print("采集统计 —— 回调收到:", state.get("recv"),
+          " 丢弃:", state.get("drop"),
+          " 最近帧间隔(ms):", [None if v is None else round(v) for v in state.get("arr", [])])
+    for s in state.get("status", []):
+        print("   状态栏:", s.replace("\n", "  ||  "))
+    print("高度图耗时(ms):", [None if v is None else round(v) for v in state.get("height_lat", [])])
+    print("  其中计算段(ms):", [None if v is None else round(v) for v in state.get("height_comp", [])])
+    for s in state.get("height_timing", []):
+        print("   高度图:", s)
     print("画布项复用:", state["item_same"], " Tk 图像原地更新:", state["photo_same"])
     print("配置段数:", store2.segment_count(), " 文件字节:", os.path.getsize(TEST_CFG_PATH))
     print("弹窗记录:", box.calls)
