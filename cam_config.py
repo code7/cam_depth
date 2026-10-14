@@ -51,6 +51,20 @@ DEFAULT_FILTER = {"min_mm": 500.0, "max_mm": 2000.0}
 DEFAULT_DEPTH_SCALE_MM = 0.125
 DEFAULT_DISPLAY_INTERVAL_MS = 80
 
+# 切平算法的参数（按相机独立）
+DEFAULT_CUT = {"a_max_mm2": 500.0, "gap_px": 3, "roi_mode": "manual"}
+
+# Modbus / RS-485（整机共用，不分相机）。
+# 现场确认：9600 8N1、站号 1、树莓派上一般是 /dev/ttySC0
+DEFAULT_MODBUS = {
+    "enabled": False,
+    "port": "/dev/ttySC0",
+    "baudrate": 9600,
+    "slave_addr": 1,
+    "addr_base": 0,          # 40001 对应线上地址 0 还是 1，现场用日志确认
+    "timeout_s": 3.0,
+}
+
 # 需要持久化、并在打开相机时重新下发的采集参数
 ACQ_FEATURES = ("AcquisitionFrameRateEnable", "AcquisitionFrameRate")
 
@@ -187,7 +201,8 @@ def now_str() -> str:
 
 
 def default_app_config() -> dict:
-    return {"display_interval_ms": DEFAULT_DISPLAY_INTERVAL_MS}
+    return {"display_interval_ms": DEFAULT_DISPLAY_INTERVAL_MS,
+            "modbus": dict(DEFAULT_MODBUS)}
 
 
 def default_camera_config(serial: str) -> dict:
@@ -206,6 +221,7 @@ def default_camera_config(serial: str) -> dict:
         },
         "filter": dict(DEFAULT_FILTER),
         "depth": {"scale_mm": DEFAULT_DEPTH_SCALE_MM},
+        "cut": dict(DEFAULT_CUT),
         "acquisition": {
             "features": {},            # {名字: {"type": ..., "value": ...}}
             "image_mode": None,        # {"width":..,"height":..,"pixel_format":..}
@@ -308,6 +324,23 @@ def validate_camera_config(raw, serial: str):
         if not ok:
             warn.append("深度换算系数非法，已用默认值")
         cfg["depth"] = {"scale_mm": sc}
+
+    # 切平参数
+    cut = raw.get("cut") or {}
+    if isinstance(cut, dict):
+        am, ok = _num(cut.get("a_max_mm2"), DEFAULT_CUT["a_max_mm2"], 1.0, 1e7)
+        if not ok:
+            warn.append("最大单坑面积非法，已用默认值")
+        try:
+            gp = int(cut.get("gap_px", DEFAULT_CUT["gap_px"]))
+        except (TypeError, ValueError):
+            gp = DEFAULT_CUT["gap_px"]
+        gp = max(0, min(50, gp))
+        mode = str(cut.get("roi_mode") or "manual")
+        if mode not in ("manual", "auto"):
+            warn.append(f"ROI 模式 {mode!r} 不识别，已改为 manual")
+            mode = "manual"
+        cfg["cut"] = {"a_max_mm2": am, "gap_px": gp, "roi_mode": mode}
 
     # 采集参数
     acq = raw.get("acquisition") or {}
@@ -444,6 +477,20 @@ class ConfigStore:
                               DEFAULT_DISPLAY_INTERVAL_MS, 10, 5000)
                 if ok:
                     self.app["display_interval_ms"] = int(iv)
+                mbus = app.get("modbus")
+                if isinstance(mbus, dict):
+                    m = dict(self.app.get("modbus") or DEFAULT_MODBUS)
+                    m["enabled"] = bool(mbus.get("enabled", m["enabled"]))
+                    if mbus.get("port"):
+                        m["port"] = str(mbus["port"])
+                    for key, lo, hi in (("baudrate", 1200, 4000000),
+                                        ("slave_addr", 1, 247),
+                                        ("addr_base", 0, 1),
+                                        ("timeout_s", 0.2, 60.0)):
+                        v, ok2 = _num(mbus.get(key), m[key], lo, hi)
+                        if ok2:
+                            m[key] = v if key == "timeout_s" else int(v)
+                    self.app["modbus"] = m
 
         self.locked = len(pending)
         missing = [s for s in serials

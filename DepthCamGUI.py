@@ -22,6 +22,9 @@ from PIL import Image, ImageTk
 
 import vcamera as vcam
 import cam_config as cfgmod
+import cut_plane
+import modbus_rtu as mb
+from modbus_service import ModbusService
 
 
 CANVAS_W = 600          # 单个相机画布的初始宽度
@@ -37,6 +40,11 @@ REFRESH_CHOICES = ("30", "50", "80", "120", "200", "300")
 
 # 超过这么久没有新帧就在状态栏给出断流提示
 STALL_WARN_S = 3.0
+# 超过这么久没有新帧就自动恢复相机。
+# 实测：相机可能静默卡死（状态显示 Capturing 但一帧不出），而且
+# StopCapture→StartCapture **救不回来**，必须 Disconnect→Connect 重连才有效。
+STALL_RECOVER_S = 8.0
+RECOVER_MAX_ATTEMPTS = 6
 
 # 配置文件默认放在程序目录下的 config/
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
@@ -159,6 +167,16 @@ class CameraPanel:
         # ---- 这台相机在配置里的参数（按序列号关联，解锁后填入） ----
         self.camera_cfg = None
 
+        # ---- 内参（第一次拿到帧时缓存，用于把像素面积换算成 mm²） ----
+        self.fx = None
+        self.fy = None
+        self.cut_test_running = False
+
+        # ---- 帧序号：Modbus 服务靠它判断"触发之后有没有来新帧" ----
+        self.frame_seq = 0
+        # ---- 切平参数（按相机存）----
+        self.a_max_mm2 = cfgmod.DEFAULT_CUT["a_max_mm2"]
+
         # ---- 帧间隔统计 ----
         # 注意线程边界：frame_callback 跑在 SDK 原生线程上，只允许读写这几个
         # 普通变量；任何 Tk 控件的更新都必须回到主线程（见 pump_frame）。
@@ -169,6 +187,11 @@ class CameraPanel:
         self.arrival_history = collections.deque(maxlen=10)
         self.last_render_wall = None    # 上一帧真正画到屏幕上的时刻
         self.stall_notified = False
+        # ---- 断流自动恢复 ----
+        self.last_frame_wall = None     # 上一次收到帧的时刻（回调线程写）
+        self.recovering = False
+        self.recover_count = 0
+        self._recover_result = None
 
         # ---- 「这一帧到达到上屏」的耗时（毫秒）----
         self.latency_ms = None          # 最近一次的总耗时
@@ -209,6 +232,8 @@ class CameraPanel:
         self.btn_grab.pack(side="left", padx=2)
         self.btn_calib = ttk.Button(ctrl, text="标定平面", command=self.start_calibration, state="disabled")
         self.btn_calib.pack(side="left", padx=2)
+        self.btn_cuttest = ttk.Button(ctrl, text="切面测试", command=self.run_cut_test, state="disabled")
+        self.btn_cuttest.pack(side="left", padx=2)
         self.chk_height = ttk.Checkbutton(ctrl, text="显示高度图", variable=self.show_height)
         self.chk_height.pack(side="left", padx=6)
 
@@ -226,10 +251,17 @@ class CameraPanel:
         self.ent_max.pack(side="left", padx=2)
         self.ent_max.insert(0, str(int(cfgmod.DEFAULT_FILTER["max_mm"])))
 
+        ttk.Label(flt, text="最大单坑(mm²):").pack(side="left", padx=(12, 2))
+        self.ent_amax = ttk.Entry(flt, width=8)
+        self.ent_amax.pack(side="left", padx=2)
+        self.ent_amax.insert(0, f"{self.a_max_mm2:.0f}")
+
         # 输入框失焦或回车时把过滤区间存进这台相机的配置
         for ent in (self.ent_min, self.ent_max):
             ent.bind("<FocusOut>", self.on_filter_changed)
             ent.bind("<Return>", self.on_filter_changed)
+        self.ent_amax.bind("<FocusOut>", self.on_cut_changed)
+        self.ent_amax.bind("<Return>", self.on_cut_changed)
 
         # 画布
         self.canvas = tk.Canvas(self.frame, width=CANVAS_W, height=CANVAS_H, bg="black",
@@ -272,6 +304,59 @@ class CameraPanel:
             self.calibrated = False
             self.roi = None
 
+        cut = cfg.get("cut") or {}
+        self.a_max_mm2 = float(cut.get("a_max_mm2", cfgmod.DEFAULT_CUT["a_max_mm2"]))
+        self.ent_amax.delete(0, "end")
+        self.ent_amax.insert(0, f"{self.a_max_mm2:.0f}")
+
+    def on_cut_changed(self, _event=None):
+        """最大单坑面积变化：写回这台相机的配置并存盘。"""
+        try:
+            v = float(self.ent_amax.get())
+        except ValueError:
+            return
+        if self.serial is None:
+            return
+        self.a_max_mm2 = max(1.0, v)
+        cfg = self.app.store.camera(self.serial)
+        cut = dict(cfg.get("cut") or cfgmod.DEFAULT_CUT)
+        cut["a_max_mm2"] = self.a_max_mm2
+        cfg["cut"] = cut
+        self.app.save_config(f"相机 {self.index + 1} 最大单坑面积已保存")
+
+    def panel_data(self):
+        """给 Modbus 服务用的面板快照。"""
+        return {
+            "serial": self.serial,
+            "depth": self.depth_data,
+            "plane": ((self.plane_a, self.plane_b, self.plane_c)
+                      if self.calibrated else None),
+            "calibrated": bool(self.calibrated),
+            "running": bool(self.is_running),
+            "frame_id": self.frame_seq,
+            "fx": self.fx, "fy": self.fy,
+            "a_max_mm2": self.a_max_mm2,
+        }
+
+    def apply_fitted_plane(self, coeffs):
+        """Modbus 校准请求拟合出的基准面回填到本面板（不经过手动框选）。"""
+        a, b, c = (float(v) for v in coeffs)
+        self.plane_a, self.plane_b, self.plane_c = a, b, c
+        self.calibrated = True
+        if self.serial is not None:
+            cfg = self.app.store.camera(self.serial)
+            cfg["calibration"] = {
+                "type": "plane_xy",
+                "coefficients": [a, b, c],
+                "unit": "mm",
+                "roi": None,
+                "inlier_ratio": None,
+                "calibrated_at": cfgmod.now_str(),
+            }
+            self.camera_cfg = cfg
+        self.lbl_status.config(text=f"基准面已由 Modbus 校准："
+                                    f"d = {a:.5f}·x + {b:.5f}·y + {c:.2f}")
+
     def on_filter_changed(self, _event=None):
         """距离过滤输入框变化：写回这台相机的配置并存盘。"""
         rng = self.get_dist_range()
@@ -304,6 +389,7 @@ class CameraPanel:
             self.arrival_ms = (now - prev) * 1000.0
             self.arrival_history.append(self.arrival_ms)
         self.frames_received += 1
+        self.last_frame_wall = now
         # 连同到达时刻一起入队：显示端要算「这一帧从到达到上屏花了多久」。
         # 不能用另一个成员变量记时刻——回调线程可能在主线程取走帧之后、
         # 读取时刻之前又塞进新的一帧，那样量出来的耗时会偏小。
@@ -397,6 +483,7 @@ class CameraPanel:
         self.btn_stop.config(state="disabled")
         self.btn_grab.config(state="normal")
         self.btn_calib.config(state="normal", text="标定平面", command=self.start_calibration)
+        self.btn_cuttest.config(state="normal")
         note = ""
         if self.calibrated:
             note = "，已载入标定参数"
@@ -531,6 +618,7 @@ class CameraPanel:
         self.btn_stop.config(state="disabled")
         self.btn_grab.config(state="disabled")
         self.btn_calib.config(state="disabled", text="标定平面", command=self.start_calibration)
+        self.btn_cuttest.config(state="disabled")
         self.canvas.delete("all")
         self.lbl_status.config(text="相机已关闭")
         self.lbl_coord.config(text="坐标: (---, ---)   深度: ---")
@@ -567,8 +655,15 @@ class CameraPanel:
         self.last_arrival = None
         self.arrival_ms = None
         self.arrival_history.clear()
-        self.last_render_wall = None
+        # 断流计时的基准从"开始采集"算起。
+        # 不能只依赖 last_render_wall：从没收到过帧的相机两个时间都是 None，
+        # 那样 _check_stall 会直接返回，永远触发不了自动恢复。
+        self.last_render_wall = time.monotonic()
+        self.last_frame_wall = self.last_render_wall
         self.stall_notified = False
+        self.recovering = False
+        self.recover_count = 0
+        self._recover_result = None
         self.latency_ms = None
         self.latency_history.clear()
         self.stage_wait_ms = None
@@ -742,6 +837,15 @@ class CameraPanel:
         self.src_h = self.depth_h
         t_computed = time.perf_counter()
 
+        # 顺手缓存内参（只做一次），后面把像素面积换算成 mm² 要用
+        if self.fx is None:
+            try:
+                K = np.asarray(depth_image.calib_info().intrinsic.matrix,
+                               dtype=np.float64)
+                self.fx, self.fy = float(K[0, 0]), float(K[1, 1])
+            except Exception:
+                self.fx = self.fy = None
+
         self._redraw_image()
         t_shown = time.perf_counter()
 
@@ -874,18 +978,100 @@ class CameraPanel:
 
         self.last_render_wall = time.monotonic()
         self.stall_notified = False
+        self.recover_count = 0     # 真正出画面了才清空重试预算
+        self.frame_seq += 1        # Modbus 服务靠它判断新帧
         self.lbl_status.config(text=self.status_text())
 
     def _check_stall(self):
-        """长时间没有新帧时提示一次（相机断流/掉线），避免界面悄悄停住没人知道。"""
-        if self.stall_notified or self.last_render_wall is None:
+        """没新帧时的处理：先提示，再自动恢复相机。
+
+        实测相机可能静默卡死（相机状态仍是 Capturing，但回调一帧都不来），
+        而且 StopCapture→StartCapture 救不回来，只有 Disconnect→Connect 有效，
+        所以这里走的是完整重连。
+        """
+        if self._recover_result is not None:
+            self._finish_recover()
             return
-        gap = time.monotonic() - self.last_render_wall
-        if gap < STALL_WARN_S:
+        if self.recovering:
+            return
+        ref = self.last_frame_wall or self.last_render_wall
+        if ref is None:
+            return
+        gap = time.monotonic() - ref
+
+        if gap >= STALL_RECOVER_S:
+            if self.recover_count < RECOVER_MAX_ATTEMPTS:
+                self.lbl_status.config(
+                    text=f"⚠ 已 {gap:.1f}s 无新帧，正在自动恢复相机"
+                         f"（第 {self.recover_count + 1} 次）…")
+                self._start_recover()
+            elif not self.stall_notified:
+                self.stall_notified = True
+                self.lbl_status.config(
+                    text=f"⚠ 相机断流且连续恢复 {RECOVER_MAX_ATTEMPTS} 次失败，"
+                         f"请检查供电/网线后重新打开相机")
+            return
+
+        if self.stall_notified or gap < STALL_WARN_S:
             return
         self.stall_notified = True
-        self.lbl_status.config(
-            text=f"⚠ 采集中，但已 {gap:.1f} s 没有新帧（相机可能断流）")
+        self.lbl_status.config(text=f"⚠ 采集中，但已 {gap:.1f} s 没有新帧（相机可能断流）")
+
+    # ------------------------------------------------------------------ 断流恢复
+    def _start_recover(self):
+        self.recovering = True
+        self.recover_count += 1
+        self._recover_result = None
+        threading.Thread(target=self._recover_worker, daemon=True).start()
+
+    def _recover_worker(self):
+        """断开重连并重启采集。跑在工作线程里，不碰 Tk 控件。"""
+        err = None
+        newcam = None
+        old = self.cam
+        try:
+            try:
+                old.StopCapture()
+            except Exception:
+                pass
+            try:
+                old.Disconnect()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            cam = vcam.CameraFactory.GetCameraBySerialNumber(self.serial)
+            st = cam.Connect()
+            if not st:
+                raise RuntimeError(f"重连失败：{st.message()}")
+            m, st = cam.GetFeature("AcquisitionMode")
+            if st:
+                m.SetValue(2)
+            cam.SetSensorEnabled(vcam.SensorType.Depth, True)
+            cam.RegisterFrameSetCallback(self.frame_callback)
+            if not cam.StartCapture():
+                raise RuntimeError("重连后启动采集失败")
+            newcam = cam
+        except Exception as e:
+            err = str(e)
+        self._recover_result = (err, newcam)
+
+    def _finish_recover(self):
+        """回到主线程收尾。"""
+        err, newcam = self._recover_result
+        self._recover_result = None
+        self.recovering = False
+        if err or newcam is None:
+            self.lbl_status.config(text=f"⚠ 自动恢复失败：{err}")
+            return
+        self.cam = newcam
+        self._clear_queue()
+        n = self.recover_count
+        self.last_frame_wall = time.monotonic()   # 重新开始计时，避免立刻又触发
+        self.last_render_wall = self.last_frame_wall
+        self.stall_notified = False
+        # 注意：这里**不**清零 recover_count。重连成功不代表出帧正常，
+        # 只有真的收到画面了（pump_frame）才清空重试预算，否则会无限重连。
+        self.lbl_status.config(text=f"相机已自动重连（第 {n} 次），等待新帧…")
 
     def compute_height_map(self):
         # 用广播代替 np.indices，避免每帧分配两块 int64 全尺寸数组（2048x1536 时各 25MB）
@@ -1035,6 +1221,178 @@ class CameraPanel:
             text=f"标定完成：d = {a:.5f}·x + {b:.5f}·y + {c:.2f}，内点率 {ratio:.1%}{saved}。"
                  f"勾选【显示高度图】查看高度")
 
+    # ------------------------------------------------------------------ 切面测试
+    def run_cut_test(self):
+        """诊断按钮：报告基准面、噪声、以及不同 a_max 下算出的切深。
+
+        这一步只是"看数据"，不参与生产流程 —— 用来在真机上决定
+        a_max / 降噪 / 空洞填补这几个参数该怎么定。
+        """
+        if self.depth_data is None:
+            messagebox.showwarning("提示", f"{self.name}：暂无图像，请先【开始】或【获取一帧】")
+            return
+        if self.cut_test_running:
+            return
+
+        self.cut_test_running = True
+        self.btn_cuttest.config(state="disabled")
+        self.lbl_status.config(text="正在做切面测试，请稍候...")
+        self.root.update_idletasks()
+
+        data = np.array(self.depth_data)
+        coeffs = ((self.plane_a, self.plane_b, self.plane_c)
+                  if self.calibrated else None)
+        fx, fy = self.fx, self.fy
+        threading.Thread(target=self._cut_test_worker,
+                         args=(data, coeffs, fx, fy), daemon=True).start()
+
+    def _cut_test_worker(self, data, coeffs, fx, fy):
+        try:
+            report = build_cut_test_report(data, coeffs, fx, fy, self.name)
+            err = None
+        except Exception as e:
+            report, err = None, str(e)
+        self.root.after(0, lambda: self._cut_test_done(report, err))
+
+    def _cut_test_done(self, report, err):
+        self.cut_test_running = False
+        self.btn_cuttest.config(state="normal")
+        if err:
+            messagebox.showerror("切面测试失败", f"{self.name}: {err}")
+            self.lbl_status.config(text="切面测试失败")
+            return
+        self.lbl_status.config(text="切面测试完成，结果见弹窗")
+        self.app.show_report(f"{self.name} · 切面测试", report)
+
+
+def build_cut_test_report(data_mm, coeffs, fx, fy, name="相机", pick_a_max=500.0):
+    """生成切面测试报告文本。不依赖 Tk，便于单测。
+
+    报告分两步走，对应现场的两个方案：
+      方案 A  零凹坑：切到最低点，保证不留凹坑，但最费料（标尺）
+      方案 B  容差切平：允许单个连通凹坑 ≤ a_max，换取厚度
+    """
+    lines = [f"===== {name} 切面测试 =====", ""]
+    valid = cut_plane.valid_mask(data_mm)
+    if not valid.any():
+        raise RuntimeError("这一帧没有有效深度数据")
+    h_img, w_img = data_mm.shape
+
+    # 1) 基准面
+    if coeffs is None:
+        # 没标定过就临时在中心区域拟合一个，只为了把 a、b 的量级看出来
+        roi = (w_img // 4, h_img // 4, 3 * w_img // 4, 3 * h_img // 4)
+        res = fit_plane_ransac(data_mm, roi)
+        if res is None:
+            lines.append("基准面：（未标定，且临时拟合失败）")
+            return "\n".join(lines)
+        a, b, c, ratio = res
+        lines.append("基准面：**临时拟合**（还没有标定，仅供参考）")
+        lines.append(f"  区域 {roi}")
+    else:
+        a, b, c = coeffs
+        ratio = float("nan")
+        lines.append("基准面：来自已保存的标定")
+    lines.append(f"  z = {a:.6f}·x + {b:.6f}·y + {c:.2f}")
+    if ratio == ratio:
+        lines.append(f"  内点率 {ratio:.1%}")
+    slope = float(np.degrees(np.arctan(np.hypot(a, b))))
+    lines.append(f"  面内坡度 {slope:.3f} 度"
+                 f"（接近 0 说明基准面正对相机；明显不为 0 则现有线性拟合会有系统误差）")
+    lines.append(f"  a、b 对整幅图的影响 |a|·W={abs(a)*w_img:.2f} mm，"
+                 f"|b|·H={abs(b)*h_img:.2f} mm")
+    lines.append("")
+
+    plane = cut_plane.plane_from_coeffs((a, b, c), data_mm.shape)
+    h = cut_plane.build_height(data_mm, plane)
+
+    # 2) 有效点与面积
+    if fx and fy:
+        mm2_px = cut_plane.mm2_per_pixel(data_mm, fx, fy)
+        lines.append(f"内参：fx={fx:.1f} fy={fy:.1f}  → 每像素 {mm2_px:.4f} mm²")
+    else:
+        mm2_px = 1.0
+        lines.append("内参：**不可用**，面积按像素数计（a_max 的单位此时是像素）")
+
+    lines.append(f"有效深度点：{valid.mean()*100:.1f}%"
+                 f"   （立体相机在光滑木面上覆盖率可能偏低，需重点确认）")
+    lines.append(f"有效面积：{valid.sum()*mm2_px/100:.1f} cm²")
+    lines.append("")
+
+    # 3) 噪声
+    rng = cut_plane.diagnose(h, valid, mm2_px,
+                             a_max_list=(50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0))
+    lines.append(f"高度 h = 深度 − 基准面（近负远正）")
+    lines.append(f"  均值 {rng['mean']:+.3f} mm   标准差 {rng['std']:.3f} mm")
+    lines.append(f"  范围 {rng['min']:+.3f} ~ {rng['max']:+.3f} mm")
+    lines.append(f"  中值滤波残差：稳健噪声估计(MAD) = {rng['noise_mad']:.3f} mm"
+                 f"   ← 这个才是噪声水平")
+    lines.append(f"                高频 std = {rng['hf_std']:.3f} mm"
+                 f"   （含真实台阶/边缘，通常明显偏大，仅供参考）")
+    lines.append(f"  （测量噪声直接决定方案A 的切深，也决定要不要先降噪）")
+    lines.append("")
+    lines.append("面积加权分位数（对应『总凹坑面积占比 ≤ α』的另一种口径，仅供参考）：")
+    for al, v in rng["quantiles"].items():
+        lines.append(f"  α={al:.0%} → 切深 {v:+.3f} mm")
+    lines.append("")
+
+    # 4) 方案 A：零凹坑
+    plan_a = cut_plane.solve_no_pit(h, valid, mm2_px)
+    lines.append("【方案 A】零凹坑 —— 切到最低点（最费料，作为标尺）")
+    lines.append(f"  切深 δA = {plan_a['delta_mm']:+.3f} mm"
+                 f"   （相对基准面的偏移，正值=比基准面切得更深）")
+    lines.append(f"  切除体积 = {plan_a['cut_volume_mm3']/1000:.1f} cm³"
+                 f"      残留凹坑 = 0 个")
+    worst_robust = max(plan_a["robust"].values()) if plan_a["robust"] else plan_a["delta_mm"]
+    gap = plan_a["delta_mm"] - worst_robust
+    for p, v in sorted(plan_a["robust"].items(), reverse=True):
+        lines.append(f"  稳健性：去掉最高 {1-p:.02%} 像素后 δ = {v:+.3f} mm"
+                     f"（差 {plan_a['delta_mm']-v:.3f} mm）")
+    lines.append(f"  最高点 0.2mm 内的像素只有 {plan_a['near_max_count']} 个")
+    if gap > 0.3:
+        lines.append(f"  ⚠ 稳健性差值 {gap:.3f} mm 偏大 —— δA 主要由极少数像素决定，"
+                     f"很可能是在切噪声/坏点，建议先降噪再采信这个数")
+    lines.append("")
+
+    # 5) 方案 B：容差切平（扫描）
+    lines.append("【方案 B】容差切平 —— 只要『单个连通凹坑面积 ≤ a_max』，其余凹坑允许保留")
+    lines.append(f"  {'a_max(mm²)':>12} {'切深δB(mm)':>11} {'最大坑(mm²)':>12} "
+                 f"{'凹坑占比':>9} {'坑数':>5} {'贴边':>5} {'二分':>5}")
+    for a_max, r in rng["a_max_sweep"].items():
+        if "error" in r:
+            lines.append(f"  {a_max:>12.0f}   失败: {r['error']}")
+            continue
+        lines.append(f"  {a_max:>12.0f} {r['delta_mm']:>11.3f} "
+                     f"{r['max_pit_area_mm2']:>12.1f} {r['pit_ratio']:>9.2%} "
+                     f"{r['pit_count']:>5} {r['edge_pits']:>5} {r['iterations']:>5}")
+    lines.append("")
+
+    # 6) 两步对比：容差换来多少料
+    ref = cut_plane.solve_cut_plane(h, valid, mm2_px, pick_a_max)
+    saved_depth = plan_a["delta_mm"] - ref["delta_mm"]
+    saved_vol = plan_a["cut_volume_mm3"] - ref["cut_volume_mm3"]
+    lines.append(f"【对比】以 a_max = {pick_a_max:.0f} mm² 为例，容差换来的收益")
+    lines.append(f"  方案A δA = {plan_a['delta_mm']:+.3f} mm   （零凹坑）")
+    lines.append(f"  方案B δB = {ref['delta_mm']:+.3f} mm   "
+                 f"（最大坑 {ref['max_pit_area_mm2']:.1f} mm²，"
+                 f"凹坑占比 {ref['pit_ratio']:.2%}，共 {ref['pit_count']} 个）")
+    lines.append(f"  省下厚度 = δA − δB = {saved_depth:+.3f} mm")
+    lines.append(f"  省下木料 ≈ {saved_vol/1000:.1f} cm³")
+    if saved_depth > 0 and gap > saved_depth:
+        lines.append(f"  注：方案A 的稳健性差值({gap:.3f} mm)大于容差收益({saved_depth:.3f} mm)，"
+                     f"说明当前数据里方案A 的数字还不可靠")
+    lines.append("")
+
+    lines.append("说明：")
+    lines.append("  · 切深是相对基准面的偏移，正值表示比基准面切得更深。")
+    lines.append("  · 贴边的坑面积被画面截断，数值不可信，选择 a_max 时要留意。")
+    lines.append("  · 方案A 是理论最费料的上界；方案B 用 a_max 换取厚度，"
+                 "a_max 越大省料越多、但留下的坑越大。")
+    if valid.mean() < 0.5:
+        lines.append("  · ⚠ 有效点不足 50%，空洞会把大坑切碎、使结果偏乐观，"
+                     "建议先改善拍摄条件或加大空洞填补半径。")
+    return "\n".join(lines)
+
 
 class DepthCamApp:
     """主窗口：两台深度相机面板 + 全局的批量操作与配置管理。"""
@@ -1054,11 +1412,114 @@ class DepthCamApp:
         self.has_config_file = self.store.load()
         self.unlock_report = None
 
+        # Modbus / RS-485：PLC 是主站，本程序是从站
+        self.regs = mb.HoldingRegisters(addr_base=0)
+        self.modbus = ModbusService(
+            self.regs, self.get_panel_data, log=self.log_modbus,
+            timeout_s=3.0)
+        self.modbus.on_calibrated = self.on_modbus_calibrated
+        self.modbus_log = []
+
         self._build_ui()
         self._apply_app_config()
 
         vcam.CameraUtils.Init(True)
         self.root.after(self.display_interval_ms, self._tick)
+
+    # ------------------------------------------------------------------ Modbus
+    def log_modbus(self, msg):
+        stamp = time.strftime("%H:%M:%S")
+        self.modbus_log.append(f"{stamp}  {msg}")
+        if len(self.modbus_log) > 500:
+            del self.modbus_log[:-500]
+        print(msg)
+
+    def get_panel_data(self):
+        """给 Modbus 服务的 A/B 面数据。A面=面板1，B面=面板2（按相机序列号绑定）。"""
+        return {"A": self.panels[0].panel_data(),
+                "B": self.panels[1].panel_data()}
+
+    def on_modbus_calibrated(self, res):
+        """PLC 触发的距离校准：把拟合出来的基准面回填到面板并存盘。"""
+        try:
+            if "A" in res:
+                self.panels[0].apply_fitted_plane(res["A"])
+            if "B" in res:
+                self.panels[1].apply_fitted_plane(res["B"])
+            self.save_config("基准面已由 Modbus 校准并保存")
+        except Exception as e:
+            self.log_modbus(f"[Modbus] 校准回填失败：{e}")
+
+    def toggle_modbus(self):
+        if self.modbus.running:
+            self.modbus.stop()
+            self.btn_modbus.config(text="连接485")
+            self.lbl_modbus.config(text="Modbus：未连接", fg="#888")
+            self.log_modbus("[Modbus] 已断开")
+            return
+        cfg = dict(self.store.app.get("modbus") or cfgmod.DEFAULT_MODBUS)
+        cfg["port"] = self.ent_port.get().strip() or cfg["port"]
+        try:
+            cfg["baudrate"] = int(float(self.ent_baud.get()))
+            cfg["slave_addr"] = int(float(self.ent_slave.get()))
+        except ValueError:
+            messagebox.showwarning("提示", "波特率/站号必须是数字")
+            return
+        cfg["addr_base"] = int(self.cmb_base.get())
+        self.store.app["modbus"] = cfg
+        self.save_config()
+
+        if not self.modbus.start(cfg["port"], cfg["baudrate"],
+                                 cfg["slave_addr"], cfg["addr_base"]):
+            err = self.modbus_log[-1] if self.modbus_log else "打开串口失败"
+            self.lbl_modbus.config(text=f"Modbus：连接失败", fg="#c00")
+            messagebox.showerror("485 连接失败", err)
+            return
+        self.btn_modbus.config(text="断开485")
+        self.lbl_modbus.config(
+            text=f"Modbus：已连接 {cfg['port']} @{cfg['baudrate']} "
+                 f"站号{cfg['slave_addr']} 基址{cfg['addr_base']}",
+            fg="#0a6")
+
+    def show_registers(self):
+        """寄存器监视窗口：现场对地址、看 PLC 写了什么。"""
+        s = self.regs.snapshot()
+        base = self.regs.addr_base
+        L = ["寄存器一览（文档编号 / 线上地址 / 名称 / 值）", ""]
+        for i in range(self.regs.size):
+            rw = "R" if i in mb.REG_READONLY else "W"
+            val = s[i]
+            extra = ""
+            if i == mb.REG_STATUS:
+                extra = f"   ({mb.STATUS_NAMES.get(val, '?')})"
+            elif i in (mb.REG_DIST_A, mb.REG_DIST_B):
+                extra = f"   ({val/mb.DIST_SCALE:.1f} mm)"
+            L.append(f"  {40001+i:<6} wire={i+base:<3} {rw}  "
+                     f"{mb.REG_NAMES.get(i,'?'):<20} {val:<7}{extra}")
+        L += ["", f"距离分辨率：{mb.DIST_SCALE:.0f} → 0.1mm，"
+                  f"量程 {mb.DIST_MIN_MM:.0f}~{mb.DIST_MAX_MM:.0f} mm",
+              f"连接状态：{'已连接' if self.modbus.running else '未连接'}"]
+        if self.modbus.last_result:
+            L.append(f"上次下刀位置：A面 {self.modbus.last_result[0]:.1f} mm，"
+                     f"B面 {self.modbus.last_result[1]:.1f} mm"
+                     f"（周期 {self.modbus.cycle_ms:.0f} ms）")
+        if self.modbus.last_error:
+            L.append(f"上次故障：{self.modbus.last_error}")
+        if self.modbus.slave is not None:
+            st = self.modbus.slave.stats
+            L += ["", f"通讯统计：收 {st['rx']} 帧，发 {st['tx']} 帧，"
+                      f"CRC 错 {st['crc_err']}，站号不符 {st['addr_skip']}，"
+                      f"异常响应 {st['exc']}"]
+            addrs = sorted(st["req_addrs"].items())
+            if addrs:
+                L.append("PLC 用过的线上地址（用来判断 40001 该配 0 还是 1）：")
+                L.append("  " + "，".join(f"{a}×{n}" for a, n in addrs))
+        L += ["", "PLC 写入记录（最近 20 条）："]
+        for idx, val, ts in self.regs.write_log[-20:]:
+            L.append(f"  {ts}  40001+{idx} ({mb.REG_NAMES.get(idx,'?')}) = {val}")
+        L += ["", "通讯日志（最近 40 条）："]
+        L += ["  " + x for x in self.modbus_log[-40:]]
+        self.show_report("Modbus / RS-485 监视", "\n".join(L))
 
     # ------------------------------------------------------------------ 配置
     def _apply_app_config(self):
@@ -1076,6 +1537,18 @@ class DepthCamApp:
         else:
             state = f"配置已读取（{self.store.segment_count()} 段），扫描到相机后解锁"
         self.lbl_status.config(text=state)
+
+        # 485 参数
+        mcfg = dict(self.store.app.get("modbus") or cfgmod.DEFAULT_MODBUS)
+        self.ent_port.delete(0, "end")
+        self.ent_port.insert(0, str(mcfg["port"]))
+        self.ent_baud.delete(0, "end")
+        self.ent_baud.insert(0, str(mcfg["baudrate"]))
+        self.ent_slave.delete(0, "end")
+        self.ent_slave.insert(0, str(mcfg["slave_addr"]))
+        self.cmb_base.set(str(mcfg["addr_base"]))
+        self.regs.addr_base = int(mcfg["addr_base"])
+        self.modbus.timeout_s = float(mcfg.get("timeout_s", 3.0))
 
     def unlock_config(self, serials):
         """用扫描到的相机序列号解开配置，并把参数分发到各面板。
@@ -1143,6 +1616,23 @@ class DepthCamApp:
         return "配置：" + "，".join(parts)
 
     # ------------------------------------------------------------------ 显示节拍
+    def show_report(self, title, text):
+        """弹一个可滚动、可复制的文本窗口（比 messagebox 适合放长报告）。"""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("980x620")
+        holder = ttk.Frame(win)
+        holder.pack(fill="both", expand=True, padx=6, pady=6)
+        txt = tk.Text(holder, wrap="none", font=("Consolas", 10))
+        sb = ttk.Scrollbar(holder, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+        return win
+
     def _tick(self):
         """两路画面共用的唯一刷新定时器。
 
@@ -1151,6 +1641,7 @@ class DepthCamApp:
         """
         for p in self.panels:
             p.pump_frame()
+        self.modbus.poll()          # Modbus 请求也由这个节拍驱动
         self.root.after(self.display_interval_ms, self._tick)
 
     def set_refresh_interval(self, _event=None):
@@ -1187,12 +1678,35 @@ class DepthCamApp:
         self.lbl_config = tk.Label(self.root, text="", anchor="w", fg="#0a6")
         self.lbl_config.grid(row=1, column=0, sticky="we", padx=5)
 
+        # 485 / Modbus
+        bus = ttk.Frame(self.root)
+        bus.grid(row=2, column=0, sticky="we", padx=5)
+
+        ttk.Label(bus, text="485 端口:").pack(side="left")
+        self.ent_port = ttk.Entry(bus, width=16)
+        self.ent_port.pack(side="left", padx=(2, 8))
+        ttk.Label(bus, text="波特率:").pack(side="left")
+        self.ent_baud = ttk.Entry(bus, width=7)
+        self.ent_baud.pack(side="left", padx=(2, 8))
+        ttk.Label(bus, text="站号:").pack(side="left")
+        self.ent_slave = ttk.Entry(bus, width=5)
+        self.ent_slave.pack(side="left", padx=(2, 8))
+        ttk.Label(bus, text="地址基址:").pack(side="left")
+        self.cmb_base = ttk.Combobox(bus, state="readonly", width=3, values=("0", "1"))
+        self.cmb_base.pack(side="left", padx=(2, 8))
+        self.btn_modbus = ttk.Button(bus, text="连接485", command=self.toggle_modbus)
+        self.btn_modbus.pack(side="left", padx=2)
+        ttk.Button(bus, text="寄存器监视", command=self.show_registers).pack(side="left", padx=2)
+
+        self.lbl_modbus = tk.Label(self.root, text="Modbus：未连接", anchor="w", fg="#888")
+        self.lbl_modbus.grid(row=3, column=0, sticky="we", padx=5)
+
         self.lbl_status = tk.Label(self.root, text="请先点击【扫描】", anchor="w")
-        self.lbl_status.grid(row=2, column=0, sticky="we", padx=5)
+        self.lbl_status.grid(row=4, column=0, sticky="we", padx=5)
 
         # 两台相机的面板并排显示
         container = ttk.Frame(self.root)
-        container.grid(row=3, column=0, sticky="nsew", padx=5, pady=5)
+        container.grid(row=5, column=0, sticky="nsew", padx=5, pady=5)
         for col in range(NUM_CAMERAS):
             container.columnconfigure(col, weight=1)
         container.rowconfigure(0, weight=1)
@@ -1203,7 +1717,7 @@ class DepthCamApp:
             self.panels.append(panel)
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(5, weight=1)
         self.root.bind("<Control-0>", lambda e: self.reset_all_zoom())
 
     # ------------------------------------------------------------------ 面板协作

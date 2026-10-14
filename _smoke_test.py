@@ -12,6 +12,7 @@ import tkinter as tk
 import numpy as np
 
 import cam_config as cfgmod
+import modbus_rtu as mb
 
 # 必须在创建 App 之前改掉配置路径
 import DepthCamGUI as g
@@ -212,6 +213,69 @@ def main():
           lambda: all(cfgmod.is_calibrated(app.store.camera(p.serial))
                       for p in app.panels))
 
+    # ------------------------------------------------------------ 切面分析（真实数据）
+    def run_cut_reports():
+        reps = {}
+        for p in app.panels:
+            reps[p.serial] = g.build_cut_test_report(
+                p.depth_data, (p.plane_a, p.plane_b, p.plane_c),
+                p.fx, p.fy, p.name)
+        state["cut_reports"] = reps
+
+    d.add("两路各跑一次切面分析报告",
+          run_cut_reports,
+          lambda: "cut_reports" in state
+          and all("方案A" in t and "方案B" in t and "对比" in t
+                  for t in state["cut_reports"].values()),
+          timeout=180)
+    d.add("报告里应包含有效点比例与噪声估计",
+          None,
+          lambda: all("稳健噪声估计" in t and "有效深度点" in t
+                      for t in state["cut_reports"].values()))
+
+    # ------------------------------------------------------------ Modbus 触发流程
+    d.add("Modbus：初始为待机",
+          None,
+          lambda: app.regs.get(mb.REG_STATUS) == mb.ST_IDLE)
+    d.add("Modbus：PLC 写 40002=1 触发测量",
+          lambda: app.regs.set(mb.REG_TRIGGER, 1),
+          lambda: app.regs.get(mb.REG_STATUS) == mb.ST_DONE, timeout=90)
+    d.add("Modbus：触发位被自动清零",
+          None,
+          lambda: app.regs.get(mb.REG_TRIGGER) == 0)
+    d.add("Modbus：下刀位置已写入且数值合理",
+          None,
+          lambda: state.update(
+              dist=(mb.decode_distance(app.regs.get(mb.REG_DIST_A)),
+                    mb.decode_distance(app.regs.get(mb.REG_DIST_B))),
+              cycle=app.modbus.cycle_ms) or
+          all(0 < v < mb.DIST_MAX_MM for v in
+              (mb.decode_distance(app.regs.get(mb.REG_DIST_A)),
+               mb.decode_distance(app.regs.get(mb.REG_DIST_B)))))
+    d.add("Modbus：校准请求自动拟合基准面（不框选）",
+          lambda: (state.update(cal_before=[p.calibrated for p in app.panels],
+                                plane_before=(app.panels[0].plane_c,
+                                              app.panels[1].plane_c)),
+                   app.regs.set(mb.REG_CALIBRATE, 1)),
+          lambda: app.regs.get(mb.REG_STATUS) == mb.ST_DONE
+          and app.regs.get(mb.REG_CALIBRATE) == 0, timeout=90)
+    d.add("Modbus：校准结果已回填面板",
+          None,
+          lambda: state.update(plane_after=(app.panels[0].plane_c,
+                                            app.panels[1].plane_c),
+                               cal_after=[p.calibrated for p in app.panels]) or
+          all(p.calibrated for p in app.panels))
+    d.add("Modbus：停止采集后触发应报故障并自动清触发位",
+          lambda: (app.stop_all(), app.regs.set(mb.REG_TRIGGER, 1)),
+          lambda: app.regs.get(mb.REG_STATUS) == mb.ST_FAULT
+          and app.regs.get(mb.REG_TRIGGER) == 0, timeout=30)
+    d.add("Modbus：故障原因可读",
+          None,
+          lambda: state.update(fault=app.modbus.last_error) or bool(app.modbus.last_error))
+    d.add("Modbus：恢复采集，下一帧触发应自动清除故障",
+          lambda: (app.start_all(), app.regs.set(mb.REG_TRIGGER, 1)),
+          lambda: app.regs.get(mb.REG_STATUS) == mb.ST_DONE, timeout=90)
+
     # ------------------------------------------------------------ 高度图耗时
     d.add("打开高度图显示",
           lambda: [p.show_height.set(True) for p in app.panels],
@@ -355,6 +419,22 @@ def main():
         print("   高度图:", s)
     print("画布项复用:", state["item_same"], " Tk 图像原地更新:", state["photo_same"])
     print("配置段数:", store2.segment_count(), " 文件字节:", os.path.getsize(TEST_CFG_PATH))
+    dist = state.get("dist")
+    if dist:
+        print(f"Modbus 下刀位置：A面 {dist[0]:.1f} mm，B面 {dist[1]:.1f} mm"
+              f"  周期 {state.get('cycle', 0):.0f} ms")
+    print("Modbus 故障原因（停止采集时触发）：", state.get("fault"))
+    print("Modbus 校准前后基准面 c：",
+          [None if v is None else round(v, 2) for v in state.get("plane_before", [])],
+          "->",
+          [None if v is None else round(v, 2) for v in state.get("plane_after", [])])
+    for serial, t in (state.get("cut_reports") or {}).items():
+        head = [ln for ln in t.splitlines()
+                if ln.startswith(("有效深度点", "  切深 δA", "  省下厚度"))
+                or "稳健噪声估计" in ln or ln.startswith("  方案B δB")]
+        print(f"    [{serial}] 切面分析要点:")
+        for ln in head:
+            print(f"       {ln.strip()}")
     print("弹窗记录:", box.calls)
 
     shutil.rmtree(TEST_CFG_DIR, ignore_errors=True)
