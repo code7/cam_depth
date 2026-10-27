@@ -52,7 +52,7 @@ DEFAULT_DEPTH_SCALE_MM = 0.125
 DEFAULT_DISPLAY_INTERVAL_MS = 80
 
 # 切平算法的参数（按相机独立）
-DEFAULT_CUT = {"a_max_mm2": 500.0, "gap_px": 3, "roi_mode": "manual"}
+DEFAULT_CUT = {"a_max_mm2": 500.0, "gap_px": 3, "roi_mode": "auto", "roi": None}
 
 # Modbus / RS-485（整机共用，不分相机）。
 # 现场确认：9600 8N1、站号 1、树莓派上一般是 /dev/ttySC0
@@ -63,6 +63,7 @@ DEFAULT_MODBUS = {
     "slave_addr": 1,
     "addr_base": 0,          # 40001 对应线上地址 0 还是 1，现场用日志确认
     "timeout_s": 3.0,
+    "measure_delay_s": 2.0,  # PLC 触发后等待多久再取新帧（补偿图像链路延迟）
 }
 
 # 需要持久化、并在打开相机时重新下发的采集参数
@@ -202,6 +203,7 @@ def now_str() -> str:
 
 def default_app_config() -> dict:
     return {"display_interval_ms": DEFAULT_DISPLAY_INTERVAL_MS,
+            "auto_start_modbus": True,
             "modbus": dict(DEFAULT_MODBUS)}
 
 
@@ -209,11 +211,13 @@ def default_camera_config(serial: str) -> dict:
     return {
         "serial": serial,
         "panel": None,                 # None = 由扫描结果决定；0/1 = 固定到左/右
+        "auto_calibrate": True,        # 启动后自动用计算范围拟合基准面
         "model": "",
         "firmware": "",
         "calibration": {
             "type": "plane_xy",
             "coefficients": None,      # [a, b, c]，None 表示未标定
+            "plane_center_mm": None,   # 标定时图像中心到基准面的距离
             "unit": "mm",
             "roi": None,
             "inlier_ratio": None,
@@ -275,6 +279,9 @@ def validate_camera_config(raw, serial: str):
     else:
         warn.append(f"panel 取值非法（{panel!r}），已忽略")
 
+    auto_cal = raw.get("auto_calibrate", True)
+    cfg["auto_calibrate"] = bool(auto_cal)
+
     # 标定
     cal = raw.get("calibration") or {}
     if isinstance(cal, dict):
@@ -293,6 +300,10 @@ def validate_camera_config(raw, serial: str):
                     "coefficients": vals,
                     "unit": str(cal.get("unit") or "mm"),
                 })
+                center, ok_center = _num(cal.get("plane_center_mm"), None,
+                                         -1e6, 1e6)
+                cfg["calibration"]["plane_center_mm"] = (
+                    center if ok_center else None)
                 roi = cal.get("roi")
                 if (isinstance(roi, (list, tuple)) and len(roi) == 4):
                     try:
@@ -336,11 +347,25 @@ def validate_camera_config(raw, serial: str):
         except (TypeError, ValueError):
             gp = DEFAULT_CUT["gap_px"]
         gp = max(0, min(50, gp))
-        mode = str(cut.get("roi_mode") or "manual")
+        mode = str(cut.get("roi_mode") or DEFAULT_CUT["roi_mode"])
         if mode not in ("manual", "auto"):
-            warn.append(f"ROI 模式 {mode!r} 不识别，已改为 manual")
-            mode = "manual"
-        cfg["cut"] = {"a_max_mm2": am, "gap_px": gp, "roi_mode": mode}
+            warn.append(f"ROI 模式 {mode!r} 不识别，已改为 {DEFAULT_CUT['roi_mode']}")
+            mode = DEFAULT_CUT["roi_mode"]
+        roi = cut.get("roi")
+        clean_roi = None
+        if roi is not None:
+            if isinstance(roi, (list, tuple)) and len(roi) == 4:
+                try:
+                    vals = [int(round(float(v))) for v in roi]
+                    if vals[2] > vals[0] and vals[3] > vals[1] and min(vals) >= 0:
+                        clean_roi = vals
+                    else:
+                        warn.append("计算范围 roi 非法，已忽略")
+                except (TypeError, ValueError):
+                    warn.append("计算范围 roi 非法，已忽略")
+            else:
+                warn.append("计算范围 roi 格式非法，已忽略")
+        cfg["cut"] = {"a_max_mm2": am, "gap_px": gp, "roi_mode": mode, "roi": clean_roi}
 
     # 采集参数
     acq = raw.get("acquisition") or {}
@@ -477,6 +502,8 @@ class ConfigStore:
                               DEFAULT_DISPLAY_INTERVAL_MS, 10, 5000)
                 if ok:
                     self.app["display_interval_ms"] = int(iv)
+                if "auto_start_modbus" in app:
+                    self.app["auto_start_modbus"] = bool(app["auto_start_modbus"])
                 mbus = app.get("modbus")
                 if isinstance(mbus, dict):
                     m = dict(self.app.get("modbus") or DEFAULT_MODBUS)
@@ -486,10 +513,12 @@ class ConfigStore:
                     for key, lo, hi in (("baudrate", 1200, 4000000),
                                         ("slave_addr", 1, 247),
                                         ("addr_base", 0, 1),
-                                        ("timeout_s", 0.2, 60.0)):
+                                        ("timeout_s", 0.2, 60.0),
+                                        ("measure_delay_s", 0.0, 60.0)):
                         v, ok2 = _num(mbus.get(key), m[key], lo, hi)
                         if ok2:
-                            m[key] = v if key == "timeout_s" else int(v)
+                            m[key] = (v if key in ("timeout_s", "measure_delay_s")
+                                      else int(v))
                     self.app["modbus"] = m
 
         self.locked = len(pending)

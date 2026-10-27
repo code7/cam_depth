@@ -9,9 +9,9 @@
 ---------------------------
     40001  设备状态        R   0=待机 1=测量中 2=完成 3=故障
     40002  触发测量        W   1=测量
-    40003  相机到A面木块距离 R   单位 mm
-    40004  相机到B面木块距离 R   单位 mm
-    40005  木块距离校准     W   1=距离校准
+    40003  A面相对距离      R   单位 mm，近摄像头为负、远离为正
+    40004  B面相对距离      R   单位 mm，近摄像头为负、远离为正
+    40005  基准面校准       W   1=校准
 
 **地址基址是个必须现场确认的坑**：Modbus 规范里 40001 对应线上地址 0（从 0 起），
 但很多 PLC/HMI 组态软件把 40001 当成线上地址 1（从 1 起）。搞错了就会"读得到但
@@ -47,9 +47,9 @@ REG_COUNT = 5
 REG_NAMES = {
     REG_STATUS: "设备状态",
     REG_TRIGGER: "触发测量",
-    REG_DIST_A: "相机到A面木块距离",
-    REG_DIST_B: "相机到B面木块距离",
-    REG_CALIBRATE: "木块距离校准",
+    REG_DIST_A: "A面相对距离(近负远正)",
+    REG_DIST_B: "B面相对距离(近负远正)",
+    REG_CALIBRATE: "基准面校准",
 }
 # 按寄存器表，这几个是只读的；被写时记警告但不拒绝（现场组态软件常常乱写）
 REG_READONLY = (REG_STATUS, REG_DIST_A, REG_DIST_B)
@@ -62,12 +62,13 @@ ST_FAULT = 3
 STATUS_NAMES = {ST_IDLE: "待机", ST_MEASURING: "测量中",
                 ST_DONE: "完成", ST_FAULT: "故障"}
 
-# 距离寄存器是无符号还是带符号：现场距离为正，用无符号；若以后要传带符号的
-# 偏移量（比如切深相对基准面可能为负），把这一个开关打开即可。
-DIST_SIGNED = False
+# 距离寄存器带符号：靠近摄像头为负，远离为正。
+DIST_SIGNED = True
 # 距离单位换算：寄存器值 = round(毫米 * DIST_SCALE)。
-# 现场确认用 0.1mm 分辨率，所以是 10.0；量程随之变成 6553.5mm（6.5 米）。
+# 现场确认用 0.1mm 分辨率，所以是 10.0；16 位有符号量程为 ±3276.7mm。
 DIST_SCALE = 10.0
+# 业务有效范围：超过 6 米视为无效数据（编码量程更小，超出编码量程同样报故障）。
+DIST_ABS_MAX_MM = 6000.0
 
 # 由上面两个开关推出的量程。超出量程必须报故障，**绝不能截断**——
 # 给机床一个被悄悄改过的下刀位置比直接报错危险得多。
@@ -76,13 +77,14 @@ DIST_MIN_MM = -32768 / DIST_SCALE if DIST_SIGNED else 0.0
 
 
 def encode_distance(mm_value, signed=DIST_SIGNED, scale=DIST_SCALE):
-    """把毫米值编码成寄存器整数。"""
+    """把毫米值编码成寄存器整数；超出可表示范围直接报错，绝不截断。"""
     v = int(round(float(mm_value) * scale))
-    if signed:
-        v = max(-32768, min(32767, v)) & 0xFFFF
-    else:
-        v = max(0, min(65535, v))
-    return v
+    lo, hi = (-32768, 32767) if signed else (0, 65535)
+    if not lo <= v <= hi:
+        raise ValueError(
+            f"距离 {mm_value:.1f} mm 超出寄存器可表示范围 "
+            f"({lo / scale:.1f}~{hi / scale:.1f} mm)")
+    return (v & 0xFFFF) if signed else v
 
 
 def decode_distance(raw, signed=DIST_SIGNED, scale=DIST_SCALE):
@@ -457,9 +459,17 @@ def _selftest():
     print(f" 11) 对方用过的线上地址统计: {dict(sorted(slave.stats['req_addrs'].items()))}")
 
     # 12) 距离编解码
-    for mm in (0, 1, 1234, 65535):
+    for mm in (-DIST_MAX_MM, -1, 0, 1, 1234, DIST_MAX_MM):
         assert abs(decode_distance(encode_distance(mm)) - mm) < 1e-9
-    print(f" 12) 距离编解码往返一致（1mm 分辨率，量程 0~65535mm）")
+    for bad in (DIST_MIN_MM - 1.0, DIST_MAX_MM + 1.0):
+        try:
+            encode_distance(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"越界距离 {bad} 应报错而不是截断")
+    print(f" 12) 距离编解码往返一致（0.1mm 分辨率，带符号，量程 "
+          f"{DIST_MIN_MM:.1f}~{DIST_MAX_MM:.1f}mm，越界报错）")
 
     print("\n全部自检通过")
     print("\n寄存器表（文档编号 / 线上地址 / 名称）:")
